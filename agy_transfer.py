@@ -26,6 +26,7 @@ import os
 import platform
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -609,7 +610,7 @@ def export_package(
             global_config_files: List[str] = []
             if mode == "full" and paths.config_dir.exists():
                 for root, dirs, files in os.walk(paths.config_dir):
-                    dirs[:] = [d for d in dirs if d not in ("node_modules", "projects")]
+                    dirs[:] = [d for d in dirs if d not in ("node_modules", "projects", ".git")]
                     root_p = Path(root)
                     for fn in files:
                         full_f = root_p / fn
@@ -771,6 +772,64 @@ def _remap_conversation_db(db_path: Path, str_pairs: Sequence[Tuple[str, str]]) 
         conn.close()
 
 
+def _is_git_object_path(path_or_rel: str | Path) -> bool:
+    """Checks whether a path is inside a `.git/objects/` directory (which Git marks Read-Only)."""
+    norm = str(path_or_rel).replace("\\", "/").lower()
+    return norm.startswith(".git/objects/") or "/.git/objects/" in norm
+
+
+def _safe_write_bytes(dest_file: Path, data: bytes) -> bool:
+    """
+    Safely writes `data` to `dest_file` on Windows / OneDrive / Git folders:
+    1. If `dest_file` is inside `.git/objects/` (e.g. `.idx`, `.pack`, or loose object) and
+       already exists on disk, skips overwriting immediately (Git objects are immutable).
+    2. If `dest_file` already exists and has the Windows Read-Only attribute, clears Read-Only
+       (`stat.S_IWRITE | stat.S_IREAD`) before writing.
+    3. If `PermissionError` still occurs (e.g. locked by OneDrive sync or an active plugin),
+       skips the locked file gracefully instead of aborting the entire import.
+    """
+    if _is_git_object_path(dest_file) and dest_file.exists():
+        return False
+
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    if dest_file.exists():
+        try:
+            os.chmod(dest_file, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+
+    try:
+        dest_file.write_bytes(data)
+        return True
+    except PermissionError:
+        return False
+
+
+def _safe_write_text(dest_file: Path, text: str, encoding: str = "utf-8") -> bool:
+    """Safely writes UTF-8 text to `dest_file`, clearing Read-Only flags and handling locks."""
+    return _safe_write_bytes(dest_file, text.encode(encoding))
+
+
+def _safe_extract_member(zf: zipfile.ZipFile, member: str, dest_file: Path) -> bool:
+    """Safely extracts a zip member to `dest_file`, skipping existing `.git/objects/` and handling Read-Only/OneDrive locks."""
+    if _is_git_object_path(dest_file) and dest_file.exists():
+        return False
+
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    if dest_file.exists():
+        try:
+            os.chmod(dest_file, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+
+    try:
+        with zf.open(member) as src_f, open(dest_file, "wb") as dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+        return True
+    except PermissionError:
+        return False
+
+
 def import_package(
     paths: AntigravityPaths,
     zip_path: Path,
@@ -822,10 +881,30 @@ def import_package(
         src_user_home = manifest.get("source_machine", {}).get("user_home", "")
         dst_user_home = str(paths.user_home)
 
+        # Scan existing projects on target machine to detect matching folderUri
+        existing_uri_to_pid: Dict[str, str] = {}
+        if paths.projects_dir.exists():
+            for ex_file in paths.projects_dir.glob("*.json"):
+                try:
+                    ex_data = json.loads(ex_file.read_text(encoding="utf-8"))
+                    ex_pid = ex_data.get("id") or ex_file.stem
+                    for res_item in ex_data.get("projectResources", {}).get("resources", []):
+                        f_uri = res_item.get("folderUri", "")
+                        if f_uri:
+                            existing_uri_to_pid[f_uri.lower()] = ex_pid
+                            local_p = uri_to_local_path(f_uri)
+                            if local_p:
+                                e_u, p_u = path_to_antigravity_uris(local_p)
+                                existing_uri_to_pid[e_u.lower()] = ex_pid
+                                existing_uri_to_pid[p_u.lower()] = ex_pid
+                except Exception:
+                    continue
+
         # Resolve project folder mappings (old_local_path -> target_local_path)
         folder_mappings: List[Tuple[str, str]] = []
         resolved_project_targets: Dict[str, List[str]] = {}
         workspace_name_map: Dict[str, str] = {}
+        project_id_remap: Dict[str, str] = {}
 
         for pmeta in manifest.get("projects", []):
             pid = pmeta["id"]
@@ -842,6 +921,11 @@ def import_package(
                 folder_mappings.append((orig_path, target_path))
                 p_targets.append(target_path)
 
+                t_enc_uri, _ = path_to_antigravity_uris(target_path)
+                existing_pid = existing_uri_to_pid.get(t_enc_uri.lower())
+                if existing_pid and existing_pid != pid:
+                    project_id_remap[pid] = existing_pid
+
                 old_folder_name = Path(orig_path.replace("\\", "/")).name
                 new_folder_name = Path(target_path.replace("\\", "/")).name
                 if old_folder_name and new_folder_name and old_folder_name != new_folder_name:
@@ -857,9 +941,7 @@ def import_package(
                         if member.startswith(prefix_slash) and not member.endswith("/"):
                             rel_part = member[len(prefix_slash) :]
                             dest_file = target_dir / rel_part
-                            dest_file.parent.mkdir(parents=True, exist_ok=True)
-                            with zf.open(member) as src_f, open(dest_file, "wb") as dst_f:
-                                shutil.copyfileobj(src_f, dst_f)
+                            _safe_extract_member(zf, member, dest_file)
 
             resolved_project_targets[pid] = p_targets
 
@@ -878,37 +960,48 @@ def import_package(
             old_user_home=src_user_home,
             new_user_home=dst_user_home,
         )
+        for old_pid, new_pid in project_id_remap.items():
+            if old_pid and new_pid and old_pid != new_pid:
+                str_pairs.append((old_pid, new_pid))
 
         # 1. Restore and remap paths in `gemini/config/projects/*.json`
         imported_proj_ids: List[str] = []
         for member in zf.namelist():
             if member.startswith("gemini/config/projects/") and member.endswith(".json"):
                 raw_json_text = zf.read(member).decode("utf-8")
+                orig_proj_obj = json.loads(raw_json_text)
+                orig_pid = orig_proj_obj.get("id") or Path(member).stem
+                if orig_pid in project_id_remap:
+                    mapped_pid = project_id_remap[orig_pid]
+                    if mapped_pid not in imported_proj_ids:
+                        imported_proj_ids.append(mapped_pid)
+                    continue
                 new_json_text = remap_text_strings(raw_json_text, str_pairs)
                 proj_obj = json.loads(new_json_text)
-                pid = proj_obj.get("id") or Path(member).stem
+                pid = proj_obj.get("id") or orig_pid
                 dest_json = paths.projects_dir / f"{pid}.json"
-                dest_json.write_text(
-                    json.dumps(proj_obj, indent=2, ensure_ascii=False), encoding="utf-8"
+                _safe_write_text(
+                    dest_json, json.dumps(proj_obj, indent=2, ensure_ascii=False)
                 )
                 imported_proj_ids.append(pid)
 
         # 2. Restore global configs if this is a Full Backup package
         for g_rel in manifest.get("global_config_files", []):
+            if _is_git_object_path(g_rel):
+                continue
             arc = f"gemini/config/{g_rel}"
             if arc in zf.namelist():
                 dest_g = paths.config_dir / g_rel
-                dest_g.parent.mkdir(parents=True, exist_ok=True)
                 content = zf.read(arc)
                 if g_rel.endswith((".json", ".md", ".txt", ".yaml", ".yml")):
                     try:
                         txt = content.decode("utf-8")
                         txt = remap_text_strings(txt, str_pairs)
-                        dest_g.write_text(txt, encoding="utf-8")
+                        _safe_write_text(dest_g, txt)
                         continue
                     except Exception:
                         pass
-                dest_g.write_bytes(content)
+                _safe_write_bytes(dest_g, content)
 
         # 3. Extract and remap `<conv_id>.db`, `brain/<conv_id>/`, `annotations/<conv_id>.pbtxt`
         imported_conv_ids: List[str] = []
@@ -922,8 +1015,11 @@ def import_package(
                 for ext in ("-wal", "-shm"):
                     w = paths.conversations_dir / f"{cid}.db{ext}"
                     if w.exists():
-                        w.unlink()
-                dest_db.write_bytes(zf.read(conv_arc))
+                        try:
+                            w.unlink()
+                        except OSError:
+                            pass
+                _safe_write_bytes(dest_db, zf.read(conv_arc))
                 _remap_conversation_db(dest_db, str_pairs)
 
             ann_arc = f"gemini/antigravity/annotations/{cid}.pbtxt"
@@ -933,9 +1029,9 @@ def import_package(
                 try:
                     ann_text = ann_bytes.decode("utf-8")
                     ann_text = remap_text_strings(ann_text, str_pairs)
-                    dest_ann.write_text(ann_text, encoding="utf-8")
+                    _safe_write_text(dest_ann, ann_text)
                 except Exception:
-                    dest_ann.write_bytes(ann_bytes)
+                    _safe_write_bytes(dest_ann, ann_bytes)
 
         # Extract all brain files
         brain_prefix = "gemini/antigravity/brain/"
@@ -944,17 +1040,16 @@ def import_package(
             if member.startswith(brain_prefix) and not member.endswith("/"):
                 rel_b = member[len(brain_prefix) :]
                 dest_b = paths.brain_dir / rel_b
-                dest_b.parent.mkdir(parents=True, exist_ok=True)
                 raw_b = zf.read(member)
                 if str_pairs and any(rel_b.endswith(ext) for ext in text_exts):
                     try:
                         txt_b = raw_b.decode("utf-8")
                         new_txt_b = remap_text_strings(txt_b, str_pairs)
-                        dest_b.write_text(new_txt_b, encoding="utf-8")
+                        _safe_write_text(dest_b, new_txt_b)
                         continue
                     except Exception:
                         pass
-                dest_b.write_bytes(raw_b)
+                _safe_write_bytes(dest_b, raw_b)
 
         # 4. Upsert into `conversation_summaries.db` and `agyhub_summaries_proto.pb`
         pb_entries: Dict[str, bytes] = {}
@@ -987,10 +1082,14 @@ def import_package(
                 s_dict = _deserialize_row_bytes(dict(payload["summary"]))
                 fts_rows = payload.get("fts_rows", [])
 
-                # Remap `workspace_uris`
+                # Remap `workspace_uris` and `project_id`
                 ws_uris_str = s_dict.get("workspace_uris", "[]")
                 if isinstance(ws_uris_str, str):
                     s_dict["workspace_uris"] = remap_text_strings(ws_uris_str, str_pairs)
+
+                orig_conv_pid = s_dict.get("project_id", "")
+                if orig_conv_pid in project_id_remap:
+                    s_dict["project_id"] = project_id_remap[orig_conv_pid]
 
                 # Remap `raw_summary` (Protobuf binary blob)
                 raw_b64 = s_dict.get("raw_summary_b64")
@@ -1359,6 +1458,18 @@ def run_interactive_menu(paths: AntigravityPaths) -> None:
                     if new_p:
                         overrides[orig_p] = new_p
 
+            extract_ws = True
+            if manifest.get("include_workspace_files"):
+                ext_ans = (
+                    input(
+                        "\nExtract bundled workspace source code files? "
+                        "(Enter N if folder is already synced via OneDrive/Git, default Y): "
+                    )
+                    .strip()
+                    .lower()
+                )
+                extract_ws = ext_ans not in ("n", "no")
+
             confirm = (
                 input("\nHave you completely closed Antigravity and are ready to import? (y/N): ")
                 .strip()
@@ -1373,6 +1484,7 @@ def run_interactive_menu(paths: AntigravityPaths) -> None:
                     paths=paths,
                     zip_path=z_path,
                     folder_overrides=overrides,
+                    extract_workspaces=extract_ws,
                 )
                 print("\n[✓] IMPORT & MERGE SUCCESSFUL!")
                 print(f"    - Pre-import snapshot saved at: {res['backup_dir']}")
