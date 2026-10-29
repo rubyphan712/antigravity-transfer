@@ -41,7 +41,7 @@ Chỉ cần nhấp đúp chuột vào file **`run_transfer.bat`** (hoặc mở T
 4. Công cụ sẽ tạo ra 1 file `.zip` duy nhất (ngay cả khi Antigravity đang mở, nhờ cơ chế sao lưu nóng `sqlite3.backup()`).
 
 #### Bước 2: Chuyển sang máy mới (Máy đích)
-1. Copy thư mục công cụ `Tranfer-Antigravity` kèm file `.zip` vừa xuất sang máy mới (qua USB, Google Drive, LAN...).
+1. Copy thư mục công cụ `antigravity-transfer` kèm file `.zip` vừa xuất sang máy mới (qua USB, Google Drive, LAN...).
 2. **Đóng hoàn toàn ứng dụng Antigravity trên máy mới** (kiểm tra System Tray để chắc chắn `Antigravity.exe` đã tắt).
 3. Chạy `run_transfer.bat` trên máy mới và chọn **Phím `5` (Import & Smart Remap)**:
    - Nhập đường dẫn tới file `.zip`.

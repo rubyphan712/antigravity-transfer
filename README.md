@@ -1,4 +1,4 @@
-# Antigravity Transfer (`agy-transfer`) 🚀
+# Antigravity Transfer (`antigravity-transfer`) 🚀
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -12,7 +12,7 @@
 
 ---
 
-## 💡 Why `agy-transfer`?
+## 💡 Why `antigravity-transfer`?
 
 Currently, Google Antigravity does not provide an official 1-click feature to export and migrate conversation histories and projects to a different computer (e.g., PC to laptop, changing drive letters `D:\` ↔ `C:\`, or switching Windows usernames `Alice` ↔ `Bob`).
 
@@ -21,7 +21,7 @@ If you attempt to copy the `.gemini` folder manually:
 2. **Corrupted Protobuf Binary Blobs**: Conversation state, plans, and sidebar metadata are stored as binary Protocol Buffer blobs (`trajectory_metadata_blob` and `raw_summary`). These blobs embed hardcoded `folderUri` paths. When the path length changes across machines, standard text replacement corrupts the parent `varint` length headers, breaking sidebar navigation and artifact rendering.
 3. **Database Locks & WAL Inconsistency**: If Antigravity is open, active transactions reside in `-wal` and `-shm` temporary files; simple file copies produce incomplete or corrupted snapshots.
 
-**`agy-transfer` solves all of these challenges seamlessly.**
+**`antigravity-transfer` solves all of these challenges seamlessly.**
 
 ---
 
